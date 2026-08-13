@@ -852,6 +852,9 @@ class AnthropicHandlerMixin:
             # body is undecipherable → 502.
             headers.pop("accept-encoding", None)
             tags = extract_tags(headers)
+            from headroom.proxy.savings_attribution import bind_scope
+
+            bind_scope(tags, request.scope)
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -2625,6 +2628,9 @@ class AnthropicHandlerMixin:
                     tools = _ts_after
                     tags["tool_search_deferred_tools"] = len(_ts_deferred)
                     tags["tool_search_deferred_tokens"] = _ts_saved_tokens
+                    from headroom.proxy.savings_attribution import record_savings
+
+                    record_savings(tags, "tool_search", tokens=_ts_saved_tokens)
                     transforms_applied.append(
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
@@ -2641,6 +2647,7 @@ class AnthropicHandlerMixin:
             )
 
             _pre_hook_tokens: int | None = None
+            _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2648,6 +2655,9 @@ class AnthropicHandlerMixin:
                     messages=optimized_messages,
                     tools=body.get("tools"),
                     config=self.config,
+                    tags=tags,
+                    count_messages=tokenizer.count_messages,
+                    count_tools=_count_tool_tokens,
                 )
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
@@ -2658,7 +2668,7 @@ class AnthropicHandlerMixin:
                     _pre_hook_tokens = None
                 _th_tools_before = body.get("tools")
                 _th_tok_before = _count_tool_tokens(_th_tools_before) if _th_tools_before else 0
-                run_request_hooks(_req_ctx)
+                run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
                     body["messages"] = optimized_messages
@@ -3503,26 +3513,6 @@ class AnthropicHandlerMixin:
                                 )
                                 # Update response content with final response
                                 resp_json = final_resp_json
-                                # Turn hooks (opt-in extensions) may inspect the turn or
-                                # re-drive the model before we hand back the response.
-                                # Inert when no hook is registered.
-                                from headroom.proxy.turn_hooks import (
-                                    TurnContext,
-                                    run_response_hooks,
-                                )
-
-                                final_resp_json = await run_response_hooks(
-                                    TurnContext(
-                                        provider="anthropic",
-                                        model=str(model),
-                                        messages=optimized_messages,
-                                        tools=tools,
-                                        config=self.config,
-                                    ),
-                                    final_resp_json,
-                                    api_call_fn,
-                                )
-                                resp_json = final_resp_json
                                 # Remove encoding headers since content is now uncompressed JSON
                                 ccr_response_headers = {
                                     k: v
@@ -3635,6 +3625,41 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] Memory: Tool call handling failed: {e}"
                                 )
                                 # Continue with original response
+
+                        # Buffered response hooks run for every successful turn,
+                        # not only the CCR branch. Reuse the request context so
+                        # observers close the exact turn they opened and a
+                        # search/reload hook can consume its synthetic tool call.
+                        if _req_ctx is not None and resp_json and response.status_code == 200:
+                            from headroom.proxy.turn_hooks import run_response_hooks
+
+                            async def _turn_hook_call_model(
+                                hook_messages: list[dict[str, Any]],
+                            ) -> dict[str, Any]:
+                                continuation_body = {**body, "messages": hook_messages}
+                                continuation_response = await self._retry_request(
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    timeout=self._anthropic_buffered_request_timeout(),
+                                )
+                                return continuation_response.json()
+
+                            hooked_json = await run_response_hooks(
+                                _req_ctx, resp_json, _turn_hook_call_model
+                            )
+                            if hooked_json is not resp_json:
+                                resp_json = hooked_json
+                                response = httpx.Response(
+                                    status_code=200,
+                                    content=json.dumps(resp_json).encode(),
+                                    headers={
+                                        key: value
+                                        for key, value in response.headers.items()
+                                        if key.lower() not in ("content-encoding", "content-length")
+                                    },
+                                )
 
                         total_latency = (time.time() - start_time) * 1000
 
