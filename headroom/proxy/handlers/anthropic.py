@@ -763,7 +763,19 @@ class AnthropicHandlerMixin:
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
             _strip_streaming_only_content_fields(messages)
-            pipeline_provider = provider_name
+            # MiniMax speaks the Anthropic Messages API but uses automatic
+            # prefix-cache economics (no 1.25x write premium). Reclassify the
+            # pipeline/metrics provider from upstream URL or model name so
+            # cache_by_provider lands under "minimax"; keep ``provider_name``
+            # unchanged for tool-search / first-party gating.
+            from headroom.proxy.cost import resolve_cache_economics_provider
+
+            _upstream_for_econ = upstream_base_url or getattr(self, "ANTHROPIC_API_URL", None)
+            pipeline_provider = resolve_cache_economics_provider(
+                model=model if isinstance(model, str) else None,
+                upstream_url=_upstream_for_econ if isinstance(_upstream_for_econ, str) else None,
+                provider=provider_name,
+            )
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
             with stage_timer.measure("deep_copy"):

@@ -126,7 +126,38 @@ _CACHE_ECONOMICS = {
         "write_multiplier": 1.25,
         "label": "Same as Anthropic (Bedrock)",
     },
+    "minimax": {
+        "read_multiplier": 0.1,
+        "write_multiplier": 1.0,
+        "label": "Automatic prefix cache, no TTL control, no write premium",
+    },
 }
+
+
+def resolve_cache_economics_provider(
+    *,
+    model: str | None = None,
+    upstream_url: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """Resolve which ``_CACHE_ECONOMICS`` key applies to a request.
+
+    MiniMax is Anthropic-API-compatible but does not charge Anthropic's 1.25x
+    cache-write premium (automatic prefix cache, no TTL). Prefer URL detection
+    (survives model renames), then model-name patterns, then the caller's
+    ``provider`` label. Unknown providers keep their label so
+    ``_CACHE_ECONOMICS.get(..., anthropic)`` still applies the historical
+    fallback at the call site.
+    """
+    if upstream_url and "api.minimax.io" in upstream_url.lower():
+        return "minimax"
+    if isinstance(model, str) and model:
+        bare = model.rsplit("/", 1)[-1].lower()
+        if bare.startswith("minimax-") or bare.startswith("minimax_"):
+            return "minimax"
+    if provider:
+        return provider
+    return "anthropic"
 
 
 def _summarize_transforms(transforms: list[str]) -> str:
@@ -195,7 +226,8 @@ def build_prefix_cache_stats(
         if pc["requests"] == 0:
             continue
 
-        econ = _CACHE_ECONOMICS.get(provider, _CACHE_ECONOMICS["anthropic"])
+        econ_provider = resolve_cache_economics_provider(provider=provider)
+        econ = _CACHE_ECONOMICS.get(econ_provider, _CACHE_ECONOMICS["anthropic"])
         read_mult: float = econ["read_multiplier"]  # type: ignore[assignment]
         write_mult: float = econ["write_multiplier"]  # type: ignore[assignment]
 
@@ -217,6 +249,10 @@ def build_prefix_cache_stats(
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
+                    or (
+                        provider == "minimax"
+                        and resolve_cache_economics_provider(model=model_name) == "minimax"
+                    )
                 )
                 if is_match and tokens_sent > best_tokens:
                     price_per_1m = cost_tracker._get_list_price(model_name)
